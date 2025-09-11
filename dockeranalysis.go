@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	"github.com/regclient/regclient"
 	"github.com/regclient/regclient/types/descriptor"
 	"github.com/regclient/regclient/types/ref"
 	"github.com/sissl0/DockerAnalysis/cmd"
+	"github.com/sissl0/DockerAnalysis/internal/network"
 	"github.com/sissl0/DockerAnalysis/internal/utils"
 	"github.com/sissl0/DockerAnalysis/ltr"
 	"github.com/sissl0/DockerAnalysis/pkg/database"
@@ -300,7 +303,7 @@ func regctl_test(repo string, digest_ string, size int64, outputpath string) {
 	rc := regclient.New()
 
 	// Referenz parsen (repo@digest)
-	r, err := ref.New(repo + "@" + digest_)
+	r, err := ref.New(repo)
 	if err != nil {
 		panic(err)
 	}
@@ -317,26 +320,40 @@ func regctl_test(repo string, digest_ string, size int64, outputpath string) {
 		panic(err)
 	}
 	defer reader.Close()
+
+	fmt.Println(reader.RawHeaders())
+	fmt.Println(reader.Response().Status)
 	//os.Mkdir(outputpath+digest_, 0755)
 	// In Datei schreiben
-	tarFileName := fmt.Sprintf("%s/%s.tar", outputpath, digest_)
-	out, err := os.Create(tarFileName)
-	if err != nil {
-		panic(err)
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, reader)
-	if err != nil {
-		panic(err)
-	}
 
 	archivPath := fmt.Sprintf("%s/%s/", outputpath, digest_)
-	err = utils.ExtractTar(tarFileName, archivPath)
+	_, err = utils.ExtractTar(reader, archivPath)
 	if err != nil {
-		panic("Error extracting tar: " + err.Error())
+		fmt.Printf("Error extracting tar: %s\n", err.Error())
 	}
+}
 
+func getBlob(repo string, digest_ string) error {
+	client, err := network.NewClient("", 20, 0, 0)
+	if err != nil {
+		return fmt.Errorf("error creating network client: %w", err)
+	}
+	resp, err := client.Network_Get(fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", repo, digest_), nil, nil)
+	if err != nil {
+		return fmt.Errorf("error getting blob: %w", err)
+	}
+	defer resp.Body.Close()
+	for key, values := range resp.Header {
+		for _, value := range values {
+			fmt.Printf("%s: %s\n", key, value)
+		}
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading blob body: %w", err)
+	}
+	fmt.Println(string(body))
+	return nil
 }
 
 func main() {
@@ -367,16 +384,35 @@ func main() {
 	case "count_tag_place":
 		countTagPlace(os.Args[2], "data/tag_list.jsonl")
 	case "regctl_test":
-		if len(os.Args) < 5 {
-			fmt.Println("Usage: regctl_test <repo> <digest> <size>")
+		if len(os.Args) < 2 {
+			fmt.Println("Usage: regctl_test <layer_file>")
 			return
 		}
-		size, err := strconv.ParseInt(os.Args[4], 10, 64)
+		reader, err := database.NewJSONLReader(os.Args[2])
 		if err != nil {
-			fmt.Println("Error: size must be a valid integer")
+			fmt.Println("Error opening layer file:", err)
 			return
 		}
-		regctl_test(os.Args[2], os.Args[3], size, "runtime")
+		defer reader.Close()
+		cnt := 0
+		for reader.Scanner.Scan() {
+			cnt++
+			line := reader.Scanner.Text()
+			var record map[string]any
+			err := json.Unmarshal([]byte(line), &record)
+			if err != nil {
+				fmt.Println("Error unmarshalling JSON:", err)
+				continue
+			}
+			repo := record["repo"].(string)
+			digest_ := record["layer_digest"].(string)
+			size := int64(record["size"].(float64))
+			go regctl_test(repo, digest_, size, "runtime")
+			if cnt > 25 {
+				break
+			}
+		}
+		time.Sleep(600 * time.Second)
 	case "load_layers":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: load_layers <layerfilepath> <maxFiles> <outputfile>")
@@ -394,19 +430,72 @@ func main() {
 			return
 		}
 	case "gitleaks_test":
-		if len(os.Args) < 4 {
-			fmt.Println("Usage: gitleaks_test <source> <outputfile> <size>")
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: gitleaks_test <source> <digest>")
 			return
 		}
-		size, err := strconv.Atoi(os.Args[4])
+
+		fileInfoWriter, err := database.NewRotatingJSONLWriter("runtime/results/fileinfos/", "fileinfo_", 500000000, 0)
 		if err != nil {
-			fmt.Println("Error: size must be a valid integer")
+			fmt.Println("Error creating fileInfoWriter: ", err)
+		}
+		secretsWriter, err := database.NewRotatingJSONLWriter("runtime/results/secrets/", "secrets_", 500000000, 0)
+		if err != nil {
+			fmt.Println("Error creating secretsWriter: ", err)
+		}
+		defer fileInfoWriter.Close()
+		defer secretsWriter.Close()
+		// if err := utils.GitleaksScan(os.Args[2], secretsWriter, &sync.Mutex{}, fileInfoWriter, &sync.Mutex{}, os.Args[3], 20000); err != nil {
+		// 	fmt.Println("Error running gitleaks scan:", err)
+		// 	return
+		// }
+	case "get_blob":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: get_blob <repo> <digest>")
 			return
 		}
-		if err := utils.GitleaksScan(os.Args[2], os.Args[3], size); err != nil {
-			fmt.Println("Error running gitleaks scan:", err)
+		if err := getBlob(os.Args[2], os.Args[3]); err != nil {
+			fmt.Println("Error getting blob:", err)
 			return
 		}
+	case "runtime":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: runtime <Layer File> <maxStorage in GB>")
+			return
+		}
+
+		reader, err := database.NewJSONLReader(os.Args[2])
+		if err != nil {
+			fmt.Println("Error opening layer file:", err)
+			return
+		}
+
+		defer reader.Close()
+
+		maxStorageGB, err := strconv.Atoi(os.Args[3])
+		if err != nil {
+			fmt.Println("Error: maxStorage must be a valid integer")
+			return
+		}
+
+		runtimeHandler := cmd.NewRuntimeHandler(context.Background(), reader, "runtime/results/", int64(maxStorageGB)*1e+9, runtime.NumCPU(), 30)
+		err = runtimeHandler.Run()
+		if err != nil {
+			fmt.Println("Error running runtime handler:", err)
+			return
+		}
+
+	case "get_sample":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: get_sample <unique_layer_file> <sample_file>")
+			return
+		}
+		if err := utils.CreateSample(os.Args[2], os.Args[3]); err != nil {
+			fmt.Println("Error getting sample:", err)
+			return
+		}
+	case "test_extract":
+		regctl_test("zaphodbeeblebrox/binarypy0", "sha256:00001d0ba60bc4f8a3ddc66d3e4558ccba776b4deb9e2ce3f4191a23242f221a", 51792133, "runtime_test")
 	default:
 		panic("Unknown command: " + os.Args[1])
 	}

@@ -7,12 +7,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/sissl0/DockerAnalysis/pkg/database"
 )
+
+type LayerEntry struct {
+	Digest string `json:"layer_digest"`
+	Repo   string `json:"repo"`
+	Size   int64  `json:"size"`
+}
 
 func LoadTags(outputfile string) error {
 	writer, err := database.NewJSONLWriter(outputfile)
@@ -144,59 +153,250 @@ func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 	}
 }
 
-func ExtractTar(tarFilePath, outputPath string) error {
-	file, err := os.Open(tarFilePath)
+func ExtractTar(r io.Reader, outputPath string) (int64, error) {
+	start := time.Now()
+	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return fmt.Errorf("error opening tar file: %w", err)
-	}
-	defer file.Close()
-	gz, err := gzip.NewReader(file)
-	if err != nil {
-		return fmt.Errorf("error creating gzip reader: %w", err)
+		return 0, fmt.Errorf("error creating gzip reader: %w", err)
 	}
 	defer gz.Close()
 
 	tarReader := tar.NewReader(gz)
-	fmt.Println(tarFilePath, outputPath)
+	var total int64
+
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
-			break // End of archive
+			break
 		}
 		if err != nil {
-			return fmt.Errorf("error reading tar file: %w", err)
+			return total, fmt.Errorf("error reading tar file: %w", err)
 		}
 
 		targetPath := filepath.Join(outputPath, header.Name)
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)); err != nil {
-				return fmt.Errorf("error creating directory: %w", err)
+			if err := os.MkdirAll(targetPath, 0o755); err != nil {
+				return total, fmt.Errorf("mkdir dir: %w", err)
 			}
 		case tar.TypeReg:
-			outFile, err := os.Create(targetPath)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return total, fmt.Errorf("mkdir parent: %w", err)
+			}
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 			if err != nil {
-				if err := os.MkdirAll(filepath.Dir(targetPath), os.ModePerm); err != nil {
-					return fmt.Errorf("error creating parent directories: %w", err)
-				}
-				outFile, err = os.Create(targetPath)
-				if err != nil {
-					return fmt.Errorf("error creating file: %w", err)
-				}
+				return total, fmt.Errorf("create file: %w", err)
 			}
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				outFile.Close()
-				return fmt.Errorf("error writing file: %w", err)
-			}
+			written, err := io.Copy(outFile, tarReader)
 			outFile.Close()
-			if err := os.Chmod(targetPath, os.FileMode(header.Mode)); err != nil {
-				return fmt.Errorf("error setting file permissions: %w", err)
+			if err != nil {
+				return total, fmt.Errorf("write file: %w", err)
 			}
+			total += written // entspricht header.Size, aber sicherer falls Sparse/Anpassungen
+		case tar.TypeSymlink, tar.TypeLink:
+			continue
 		default:
-			return fmt.Errorf("unsupported tar header type: %v", header.Typeflag)
+			continue
 		}
 	}
+	elapsed := time.Since(start).Seconds()
+	fmt.Printf("Extracted %d bytes in %.2f seconds (%.2f MB/s)\n", total, elapsed, float64(total)/1e6/elapsed)
+
+	return total, nil
+}
+
+// compute 10 log buckets, last one >10GB (decimal)
+func makeLogBuckets() []int64 {
+	var bounds []int64
+	minSize := float64(1)                  // 1 Byte
+	maxSize := float64(10 * 1_000_000_000) // 10 GB (decimal)
+	steps := 9                             // 9 Grenzen + letzte "infinity" bucket
+	logMin := math.Log10(minSize)
+	logMax := math.Log10(maxSize)
+	step := (logMax - logMin) / float64(steps-1)
+	for i := 0; i < steps; i++ {
+		b := math.Pow(10, logMin+step*float64(i))
+		bounds = append(bounds, int64(b))
+	}
+	bounds = append(bounds, math.MaxInt64) // >10GB
+	return bounds
+}
+
+func bucketIndex(size int64, bounds []int64) int {
+	for i, b := range bounds {
+		if size <= b {
+			return i
+		}
+	}
+	return len(bounds) - 1
+}
+
+func parseSize(num json.Number) (int64, bool) {
+	if i, err := num.Int64(); err == nil {
+		if i > 0 {
+			return i, true
+		}
+		return 0, false
+	}
+	if f, err := num.Float64(); err == nil {
+		if f <= 0 {
+			return 0, false
+		}
+		return int64(math.Round(f)), true
+	}
+	return 0, false
+}
+
+func CreateSample(uniqueLayerPath string, samplePath string) error {
+	reader, err := database.NewJSONLReader(uniqueLayerPath)
+	if err != nil {
+		return fmt.Errorf("error creating JSONL reader: %w", err)
+	}
+	defer reader.Close()
+
+	bounds := makeLogBuckets()
+
+	type raw struct {
+		Digest string      `json:"layer_digest"`
+		Layer  string      `json:"layer"`
+		Repo   string      `json:"repo"`
+		Size   json.Number `json:"size"`
+	}
+
+	totalSize := int64(0)
+	bucketSizes := make([]int64, len(bounds))
+
+	// PASS 1: Summen je Bucket
+	for reader.Scanner.Scan() {
+		var r raw
+		if err := json.Unmarshal([]byte(reader.Scanner.Text()), &r); err != nil {
+			continue
+		}
+		sz, ok := parseSize(r.Size)
+		if !ok {
+			continue
+		}
+		name := r.Digest
+		if name == "" {
+			name = r.Layer
+		}
+		if name == "" {
+			continue
+		}
+		bi := bucketIndex(sz, bounds)
+		bucketSizes[bi] += sz
+		totalSize += sz
+	}
+	if err := reader.Scanner.Err(); err != nil {
+		return fmt.Errorf("scanner error: %w", err)
+	}
+	if totalSize == 0 {
+		return fmt.Errorf("no data")
+	}
+
+	targetTotal := int64(150) * 1_000_000_000_000 // 150 TB (decimal)
+	if targetTotal > totalSize {
+		targetTotal = totalSize
+	}
+
+	// Quota (float) je Bucket proportional zur Bytegröße
+	quotaRemain := make([]float64, len(bounds))
+	bytesRemain := make([]int64, len(bounds))
+	for i, bs := range bucketSizes {
+		bytesRemain[i] = bs
+		if bs == 0 {
+			continue
+		}
+		quotaRemain[i] = float64(bs) * float64(targetTotal) / float64(totalSize)
+	}
+
+	// PASS 2: Bernoulli nach verbleibenden Quoten
+	reader2, err := database.NewJSONLReader(uniqueLayerPath)
+	if err != nil {
+		return fmt.Errorf("error creating JSONL reader (pass2): %w", err)
+	}
+	defer reader2.Close()
+
+	writer, err := database.NewJSONLWriter(samplePath)
+	if err != nil {
+		return fmt.Errorf("error creating writer: %w", err)
+	}
+	defer writer.Close()
+
+	seed := time.Now().UnixNano()
+	rng := rand.New(rand.NewSource(seed))
+
+	finalBytes := int64(0)
+	selectedCount := 0
+
+	for reader2.Scanner.Scan() {
+		var r raw
+		if err := json.Unmarshal([]byte(reader2.Scanner.Text()), &r); err != nil {
+			continue
+		}
+		sz, ok := parseSize(r.Size)
+		if !ok {
+			continue
+		}
+		name := r.Digest
+		if name == "" {
+			name = r.Layer
+		}
+		if name == "" {
+			continue
+		}
+		bi := bucketIndex(sz, bounds)
+		if bytesRemain[bi] <= 0 || quotaRemain[bi] <= 0 {
+			bytesRemain[bi] -= sz
+			continue
+		}
+
+		// Wahrscheinlichkeit = (verbleibende Quote) / (verbleibende Bytes)
+		prob := quotaRemain[bi] / float64(bytesRemain[bi])
+		if prob > 1 {
+			prob = 1
+		} else if prob < 0 {
+			prob = 0
+		}
+
+		if rng.Float64() <= prob {
+			// Aufnahme
+			entry := LayerEntry{
+				Digest: name,
+				Repo:   r.Repo,
+				Size:   sz,
+			}
+			if err := writer.Write(entry); err != nil {
+				return fmt.Errorf("write error: %w", err)
+			}
+			finalBytes += sz
+			selectedCount++
+			quotaRemain[bi] -= float64(sz)
+			if quotaRemain[bi] < 0 {
+				quotaRemain[bi] = 0
+			}
+		}
+
+		bytesRemain[bi] -= sz
+	}
+
+	if err := reader2.Scanner.Err(); err != nil {
+		return fmt.Errorf("scanner error pass2: %w", err)
+	}
+
+	// Statistik
+	finalTB := float64(finalBytes) / 1e12
+	targetTB := float64(targetTotal) / 1e12
+	// Optional: Hinweis wenn deutliche Abweichung
+	if diff := math.Abs(finalTB - targetTB); targetTB > 0 && diff/targetTB > 0.02 {
+		fmt.Printf("Warn: sample deviates by %.2f%% from target\n", diff/targetTB*100)
+	}
+
+	fmt.Printf("Sampling seed: %d\n", seed)
+	fmt.Printf("Input total size: %.2f TB\n", float64(totalSize)/1e12)
+	fmt.Printf("Target size: %.2f TB\n", targetTB)
+	fmt.Printf("Final sample size: %.2f TB (items=%d)\n", finalTB, selectedCount)
 
 	return nil
 }

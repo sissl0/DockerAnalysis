@@ -1,92 +1,240 @@
 package utils
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
+	"hash"
+	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/cespare/xxhash/v2"
+	"github.com/regclient/regclient/types/blob"
+	"github.com/sissl0/DockerAnalysis/internal/types"
+	"github.com/sissl0/DockerAnalysis/pkg/database"
 	"github.com/zricethezav/gitleaks/v8/detect"
 	"github.com/zricethezav/gitleaks/v8/sources"
 )
 
-func GitleaksScan(source string, outputfile string, size int) error {
-	detector, err := detect.NewDetectorDefaultConfig()
-	if err != nil {
-		return fmt.Errorf("error creating gitleaks detector: %w", err)
-	}
-	detector.MaxArchiveDepth = 10
-	detector.MaxDecodeDepth = 10
-	sourceFiles := &sources.Files{
-		Config:          &detector.Config,
-		FollowSymlinks:  false,
-		MaxFileSize:     detector.MaxTargetMegaBytes * 1_000_000,
-		Path:            source,
-		Sema:            detector.Sema,
-		MaxArchiveDepth: detector.MaxArchiveDepth,
-	}
-	findings, err := detector.DetectSource(
-		context.Background(),
-		sourceFiles,
-	)
-	if err != nil {
-		return fmt.Errorf("error detecting leaks: %w", err)
-	}
-	fmt.Println(findings)
-	return nil
+const (
+	cacheByteBudget = 500 * 1024 * 1024
+	approxPerEntry  = 56
+)
+
+type Scanner struct {
+	SecretWriter   *database.RotatingJSONLWriter
+	FileInfoWriter *database.RotatingJSONLWriter
+	StorageHandler *database.StorageHandler
+	Detector       *detect.Detector
 }
 
-// func BuildCommand(source string, report_path string) *cobra.Command {
-// 	cmd := &cobra.Command{
-// 		Args: nil,
-// 		Run:  DirectoryScan,
-// 	}
-// 	cmd.Flags().Int("max-target-megabytes", 0, "")
-// 	cmd.Flags().Int("max-decode-depth", 0, "")
-// 	cmd.Flags().Int("max-archive-depth", 0, "")
-// 	cmd.Flags().Bool("no-color", false, "")
-// 	cmd.Flags().String("config", "", "")
-// 	cmd.Flags().Bool("verbose", false, "")
-// 	cmd.Flags().Uint("redact", 0, "")
-// 	cmd.Flags().Bool("ignore-gitleaks-allow", false, "")
-// 	cmd.Flags().String("gitleaks-ignore-path", ".", "")
-// 	cmd.Flags().String("baseline-path", "", "")
-// 	cmd.Flags().StringSlice("enable-rule", []string{}, "")
-// 	cmd.Flags().String("report-path", report_path, "")
-// 	cmd.Flags().String("report-format", "json", "")
-// 	cmd.Flags().String("report-template", "", "")
+func NewScanner(num uint16, resultPath string, storagehandler *database.StorageHandler) (*Scanner, error) {
+	if err := os.MkdirAll(fmt.Sprintf("%s/scanner_%d/secrets/", resultPath, num), 0755); err != nil {
+		return nil, fmt.Errorf("error creating secrets directory: %v", err)
+	}
+	secretWriter, err := database.NewRotatingJSONLWriter(fmt.Sprintf("%s/scanner_%d/secrets/", resultPath, num), "secrets_", 500000000, 0)
+	if err != nil {
+		return nil, fmt.Errorf("error creating secret JSONL writer: %v", err)
+	}
 
-// 	return cmd
-// }
+	if err := os.MkdirAll(fmt.Sprintf("%s/scanner_%d/fileinfos/", resultPath, num), 0755); err != nil {
+		return nil, fmt.Errorf("error creating file info directory: %v", err)
+	}
+	fileInfoWriter, err := database.NewRotatingJSONLWriter(fmt.Sprintf("%s/scanner_%d/fileinfos/", resultPath, num), "fileinfo_", 500000000, 0)
+	if err != nil {
+		return nil, fmt.Errorf("error creating file info JSONL writer: %v", err)
+	}
+	detector, _ := detect.NewDetectorDefaultConfig()
+	detector.MaxDecodeDepth = 3
+	detector.BuildRuleIndex()
 
-// func DirectoryScan(cmd *cobra.Command, args []string) {
-// 	source := args[0]
-// 	outputfile := args[1]
-// 	cfg := gitleaksCMD.Config(cmd)
+	return &Scanner{
+		SecretWriter:   secretWriter,
+		FileInfoWriter: fileInfoWriter,
+		StorageHandler: storagehandler,
+		Detector:       detector,
+	}, nil
+}
 
-// 	detector := gitleaksCMD.Detector(cmd, cfg, source)
-// 	detector.FollowSymlinks = false
-// 	detector.Sema = semgroup.NewGroup(context.Background(), int64(runtime.NumCPU()))
-// 	findings, err := detector.DetectSource(
-// 		context.Background(),
-// 		&sources.Files{
-// 			Config:          &cfg,
-// 			FollowSymlinks:  detector.FollowSymlinks,
-// 			MaxFileSize:     detector.MaxTargetMegaBytes * 1_000_000,
-// 			Path:            source,
-// 			Sema:            detector.Sema,
-// 			MaxArchiveDepth: detector.MaxArchiveDepth,
-// 		},
-// 	)
-// 	if err != nil {
-// 		fmt.Println("Error detecting leaks:", err)
-// 	}
-// 	var file io.WriteCloser
-// 	if file, err = os.Create(outputfile); err != nil {
-// 		fmt.Println("Error creating report file:", err)
-// 		return
-// 	}
-// 	if err = detector.Reporter.Write(file, findings); err != nil {
-// 		fmt.Println("Error writing report:", err)
-// 		return
-// 	}
+func (s *Scanner) Close() {
+	s.SecretWriter.Close()
+	s.FileInfoWriter.Close()
+}
 
-// }
+func (s *Scanner) Run(input <-chan types.Extracted) {
+	for ext := range input {
+		fmt.Printf("Scanning layer %s, Size: %d\n", ext.Record.Digest, ext.Record.Size)
+		if err := s.ExtractScan(ext.Ctx, ext.Layer, ext.Record.Digest); err != nil {
+			fmt.Printf("Error scanning layer %s: %v\n", ext.Record.Digest, err)
+		}
+		ext.Cancel() // Kontext jetzt freigeben
+		s.StorageHandler.Release(ext.Reserved)
+	}
+}
+
+func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest string) error {
+	defer reader.Close()
+	gz, err := gzip.NewReader(reader)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+
+	layerFile := &sources.File{
+		Content:         gz,
+		Path:            fmt.Sprintf("%s.tar", digest),
+		Config:          &s.Detector.Config,
+		MaxArchiveDepth: s.Detector.MaxArchiveDepth,
+	}
+
+	cacheCap := int(cacheByteBudget / approxPerEntry)
+	fCache := database.NewFragCache(cacheCap)
+
+	getFragCache := func(h uint64) (bool, bool) { return fCache.Get(h) }
+	setFragCache := func(h uint64, hasSecret bool) { fCache.Set(h, hasSecret) }
+
+	var (
+		currentPath  string
+		currentSize  int64
+		currentHash  hash.Hash64
+		fileHashes   []string
+		fileHashSeen = make(map[string]struct{})
+		fileCount    int
+		maxDepth     int
+		totalSize    int64
+		secrets      []string
+		fragHashList = make(map[uint64]bool)
+		newSecrets   []types.SecretRecord
+	)
+
+	finalizeFile := func() {
+		if currentPath == "" || currentHash == nil {
+			return
+		}
+		sum := fmt.Sprintf("%x", currentHash.Sum(nil))
+
+		// schneller als strings.Split
+		depth := 1
+		if idx := strings.Count(currentPath, "/"); idx > 0 {
+			depth = idx + 1
+		}
+		if depth > maxDepth {
+			maxDepth = depth
+		}
+
+		if len(fragHashList) > 0 {
+			for fh, hasSecret := range fragHashList {
+				setFragCache(fh, hasSecret)
+			}
+		}
+
+		if _, ok := fileHashSeen[sum]; !ok {
+			fileHashSeen[sum] = struct{}{}
+			fileHashes = append(fileHashes, sum)
+		}
+
+		totalSize += currentSize
+		fileCount++
+		currentPath = ""
+		currentSize = 0
+		currentHash = nil
+		// Neu initialisieren statt delete-Schleife (schneller)
+		fragHashList = make(map[uint64]bool)
+	}
+
+	detectErr := layerFile.Fragments(ctx, func(fragment sources.Fragment, ferr error) error {
+		if ferr != nil {
+			fmt.Printf("fragment error path=%s err=%v (continue)\n", fragment.FilePath, ferr)
+			return nil
+		}
+		if fragment.FilePath == "" || (len(fragment.Raw) == 0 && len(fragment.Bytes) == 0) {
+			return nil
+		}
+
+		if fragment.FilePath != currentPath {
+			finalizeFile()
+			currentPath = fragment.FilePath
+			currentSize = 0
+			currentHash = xxhash.New()
+		}
+
+		data := fragment.Bytes
+		if len(data) == 0 && len(fragment.Raw) != 0 {
+			data = []byte(fragment.Raw)
+		}
+		if len(data) == 0 {
+			return nil
+		}
+
+		_, _ = currentHash.Write(data)
+		currentSize += int64(len(data))
+
+		fragHash := xxhash.Sum64(data)
+		if _, seen := fragHashList[fragHash]; !seen {
+			fragHashList[fragHash] = false
+		}
+
+		if hasSecret, ok := getFragCache(fragHash); ok {
+			if hasSecret {
+				secrets = append(secrets, fmt.Sprintf("%016x", fragHash))
+			}
+			return nil
+		}
+
+		findings := s.Detector.Detect(detect.Fragment(fragment))
+		if len(findings) == 0 {
+			setFragCache(fragHash, false)
+			return nil
+		}
+		fragHashList[fragHash] = true
+		setFragCache(fragHash, true)
+
+		fragHashHex := fmt.Sprintf("%016x", fragHash)
+		secrets = append(secrets, fragHashHex)
+
+		for _, finding := range findings {
+			newSecrets = append(newSecrets, types.SecretRecord{
+				FragmentHash: fragHashHex,
+				Secret: types.SecretInfo{
+					Location:  currentPath,
+					Type:      filepath.Ext(finding.File),
+					Size:      currentSize,
+					Origin:    finding.RuleID,
+					Secret:    finding.Secret,
+					StartLine: finding.StartLine,
+				},
+			})
+		}
+		return nil
+	})
+	finalizeFile()
+	if detectErr != nil {
+		fmt.Printf("scan finished with error: %v\n", detectErr)
+	}
+
+	type fileRecord struct {
+		Digest           string   `json:"digest"`
+		FileCount        int      `json:"file_count"`
+		FileHashes       []string `json:"file_hashes"`
+		MaxDepth         int      `json:"max_depth"`
+		UncompressedSize int64    `json:"uncompressed_size"`
+		Secrets          []string `json:"secrets,omitempty"`
+	}
+	fr := fileRecord{
+		Digest:           digest,
+		FileCount:        fileCount,
+		FileHashes:       fileHashes,
+		MaxDepth:         maxDepth,
+		UncompressedSize: totalSize,
+		Secrets:          secrets,
+	}
+	if err = s.FileInfoWriter.Write(fr); err != nil {
+		return fmt.Errorf("error writing file record: %v", err)
+	}
+	if err = s.SecretWriter.Write(newSecrets); err != nil {
+		return fmt.Errorf("error writing secrets: %v", err)
+	}
+
+	return nil
+}
