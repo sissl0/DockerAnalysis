@@ -34,4 +34,11 @@ type SecretRecord struct {
 	Secret       SecretInfo `json:"secrets"`
 }
 
-// --- Fragment Cache Strukturen (ersetzt localFragCache & localFragOrder) ---
+type FileRecord struct {
+	Digest    string `json:"digest"`
+	FileCount int    `json:"file_count"`
+	// FileHashes       []string `json:"file_hashes"` // AUS: Entkommentieren, wenn benötigt
+	MaxDepth         int      `json:"max_depth"`
+	UncompressedSize int64    `json:"uncompressed_size"`
+	Secrets          []string `json:"secrets,omitempty"`
+}

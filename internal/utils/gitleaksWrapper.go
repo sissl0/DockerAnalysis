@@ -4,7 +4,8 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
-	"hash"
+
+	// "hash" // Hashing für Datei-Hashes. Entkommentieren, falls File-Hashes wieder benötigt werden.
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,11 +96,11 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 	setFragCache := func(h uint64, hasSecret bool) { fCache.Set(h, hasSecret) }
 
 	var (
-		currentPath  string
-		currentSize  int64
-		currentHash  hash.Hash64
-		fileHashes   []string
-		fileHashSeen = make(map[string]struct{})
+		currentPath string
+		currentSize int64
+		// currentHash  hash.Hash64            // AUS: Dateihash-Berechnung. Entkommentieren, falls File-Hashes wieder benötigt werden.
+		// fileHashes   []string               // AUS: Sammlung der File-Hashes. Entkommentieren, falls File-Hashes wieder benötigt werden.
+		// fileHashSeen = make(map[string]struct{}) // AUS: Deduplizierung der File-Hashes. Entkommentieren, falls File-Hashes wieder benötigt werden.
 		fileCount    int
 		maxDepth     int
 		totalSize    int64
@@ -109,10 +110,12 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 	)
 
 	finalizeFile := func() {
-		if currentPath == "" || currentHash == nil {
+		if currentPath == "" /* || currentHash == nil */ { // AUS: currentHash-Check. Entkommentieren, falls File-Hashes wieder benötigt werden.
 			return
 		}
-		sum := fmt.Sprintf("%x", currentHash.Sum(nil))
+
+		// AUS: Dateihash berechnen. Entkommentieren, falls File-Hashes wieder benötigt werden.
+		// sum := fmt.Sprintf("%x", currentHash.Sum(nil))
 
 		// schneller als strings.Split
 		depth := 1
@@ -129,16 +132,18 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 			}
 		}
 
-		if _, ok := fileHashSeen[sum]; !ok {
-			fileHashSeen[sum] = struct{}{}
-			fileHashes = append(fileHashes, sum)
-		}
+		// AUS: File-Hash-Deduplizierung/Speicherung. Entkommentieren, falls File-Hashes wieder benötigt werden.
+		// if _, ok := fileHashSeen[sum]; !ok {
+		// 	fileHashSeen[sum] = struct{}{}
+		// 	fileHashes = append(fileHashes, sum)
+		// }
 
 		totalSize += currentSize
 		fileCount++
 		currentPath = ""
 		currentSize = 0
-		currentHash = nil
+		// currentHash = nil // AUS: Zurücksetzen des Dateihashes. Entkommentieren, falls File-Hashes wieder benötigt werden.
+
 		// Neu initialisieren statt delete-Schleife (schneller)
 		fragHashList = make(map[uint64]bool)
 	}
@@ -156,7 +161,7 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 			finalizeFile()
 			currentPath = fragment.FilePath
 			currentSize = 0
-			currentHash = xxhash.New()
+			// currentHash = xxhash.New() // AUS: Dateihash initialisieren. Entkommentieren, falls File-Hashes wieder benötigt werden.
 		}
 
 		data := fragment.Bytes
@@ -167,7 +172,7 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 			return nil
 		}
 
-		_, _ = currentHash.Write(data)
+		// _, _ = currentHash.Write(data) // AUS: Dateihash fortschreiben. Entkommentieren, falls File-Hashes wieder benötigt werden.
 		currentSize += int64(len(data))
 
 		fragHash := xxhash.Sum64(data)
@@ -213,18 +218,10 @@ func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest st
 		fmt.Printf("scan finished with error: %v\n", detectErr)
 	}
 
-	type fileRecord struct {
-		Digest           string   `json:"digest"`
-		FileCount        int      `json:"file_count"`
-		FileHashes       []string `json:"file_hashes"`
-		MaxDepth         int      `json:"max_depth"`
-		UncompressedSize int64    `json:"uncompressed_size"`
-		Secrets          []string `json:"secrets,omitempty"`
-	}
-	fr := fileRecord{
-		Digest:           digest,
-		FileCount:        fileCount,
-		FileHashes:       fileHashes,
+	fr := types.FileRecord{
+		Digest:    digest,
+		FileCount: fileCount,
+		// FileHashes:       fileHashes, // AUS: Schreiben der File-Hashes. Entkommentieren, falls File-Hashes wieder benötigt werden.
 		MaxDepth:         maxDepth,
 		UncompressedSize: totalSize,
 		Secrets:          secrets,
