@@ -1,3 +1,17 @@
+/*
+Georg Heindl
+Paralleler Collector für Docker Image Manifeste.
+Führt Auth Requests durch, um Token zu erhalten, und ruft dann die Manifeste ab.
+Speichert die Layer-Informationen in einer JSONL-Datei.
+Params:
+- username: Docker Hub Benutzername
+- accessToken: Docker Hub Access Token
+- timeout: Timeout für HTTP Requests
+- cookies: Cookies für Auth Requests (falls benötigt)
+- writer: JSONL Writer zum Speichern der Layer-Informationen
+- reader: JSONL Reader zum Lesen der Tags
+- proxies: Liste von Proxy-URLs für die parallelen Clients (falls keine Proxies, dann Liste mit leeren String(s) übergeben)
+*/
 package cmd
 
 import (
@@ -8,6 +22,7 @@ import (
 	"sync"
 
 	"github.com/sissl0/DockerAnalysis/internal/network"
+	"github.com/sissl0/DockerAnalysis/internal/types"
 	"github.com/sissl0/DockerAnalysis/pkg/database"
 )
 
@@ -29,16 +44,6 @@ type ManifestsCollector struct {
 	Context     context.Context
 }
 
-type Layer struct {
-	Size   int64  `json:"size"`
-	Digest string `json:"digest"`
-}
-
-type RepoDigest struct {
-	RepoName string `json:"repo"`
-	Digest   string `json:"digest"`
-}
-
 func NewManifestsCollector(username, accessToken string, timeout int, cookies map[string]any, writer *database.RotatingJSONLWriter, reader *database.JSONLReader, proxies []string) (*ManifestsCollector, error) {
 	authTasks := make(chan *network.AuthRequestTask, 7200)
 	for i, proxy := range proxies {
@@ -46,25 +51,7 @@ func NewManifestsCollector(username, accessToken string, timeout int, cookies ma
 		if err != nil {
 			return nil, fmt.Errorf("error creating first network client: %w", err)
 		}
-		go client1.AuthClientStart(authTasks, i*4)
-
-		client2, err := network.NewClient(proxy, timeout, 0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("error creating second network client: %w", err)
-		}
-		go client2.AuthClientStart(authTasks, i*4+1)
-
-		client3, err := network.NewClient(proxy, timeout, 0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("error creating third network client: %w", err)
-		}
-		go client3.AuthClientStart(authTasks, i*4+2)
-
-		client4, err := network.NewClient(proxy, timeout, 0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("error creating fourth network client: %w", err)
-		}
-		go client4.AuthClientStart(authTasks, i*4+3)
+		go client1.AuthClientStart(authTasks, i)
 	}
 
 	redis := database.NewRedisClient("localhost:6379", "", 0)
@@ -81,9 +68,11 @@ func NewManifestsCollector(username, accessToken string, timeout int, cookies ma
 	}, nil
 }
 
+/*
+Liest die Tags aus der JSONL-Datei und ruft für jeden Tag das Manifest ab.
+Speichert in Redis, welche Digests bereits verarbeitet wurden, und überspringt diese. (Absicherung für Abbruch)
+*/
 func (mc *ManifestsCollector) CollectManifests() {
-	//last_repo := "yuzyk/to-do-app-api"
-	//last_repo_reached := false
 	for mc.Reader.Scanner.Scan() {
 		line := mc.Reader.Scanner.Text()
 		var record map[string]any
@@ -94,9 +83,7 @@ func (mc *ManifestsCollector) CollectManifests() {
 		}
 		repoDigest, _ := record["digest"].(string)
 		repoName, _ := record["repo"].(string)
-		//if repoName == last_repo {
-		//	last_repo_reached = true
-		//}
+
 		if repoDigest == "" || repoName == "" {
 			fmt.Println("Invalid record:", record)
 			continue
@@ -109,13 +96,17 @@ func (mc *ManifestsCollector) CollectManifests() {
 		if isMember {
 			continue
 		}
-		//if isMember || !last_repo_reached {
-		//	continue
-		//}
+
 		mc.GetAuthToken(repoName, repoDigest)
 	}
 }
 
+/*
+Ruft ein Auth Token für das gegebene Repo ab und startet ProcessManifest als Callback.
+Params:
+- repo: Name des Repositories
+- digest: Digest des Tags
+*/
 func (mc *ManifestsCollector) GetAuthToken(repo string, digest string) {
 	authURL := authBaseURL + repo + ":pull"
 	task := &network.AuthRequestTask{
@@ -134,6 +125,13 @@ func (mc *ManifestsCollector) GetAuthToken(repo string, digest string) {
 	mc.AuthTasks <- task
 }
 
+/*
+Verarbeitet die Antwort des Manifest-Requests.
+Params:
+- resp: HTTP-Antwort des Manifest-Requests
+- repo: Name des Repositories
+- digest: Digest des Tags
+*/
 func (mc *ManifestsCollector) ProcessManifest(resp *http.Response, repo string, digest string) {
 
 	if resp.StatusCode != http.StatusOK {
@@ -142,7 +140,7 @@ func (mc *ManifestsCollector) ProcessManifest(resp *http.Response, repo string, 
 		return
 	}
 	var manifest struct {
-		Layers []Layer `json:"layers"`
+		Layers []types.Layer `json:"layers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
 		fmt.Printf("Error decoding manifest response for %s: %v\n", repo, err)
@@ -160,7 +158,11 @@ func (mc *ManifestsCollector) ProcessManifest(resp *http.Response, repo string, 
 	}
 }
 
-func (mc *ManifestsCollector) Save(layers []Layer, repo string, tagDigest string) error {
+/*
+Schreibt die Layer-Informationen in JSONL-Datei
+IO-Blockierung durch Mutex
+*/
+func (mc *ManifestsCollector) Save(layers []types.Layer, repo string, tagDigest string) error {
 	mc.SaveMutex.Lock()
 	defer mc.SaveMutex.Unlock()
 	for _, layer := range layers {

@@ -1,3 +1,8 @@
+/*
+Georg Heindl
+Cache für Fragmente mit Min-Heap basierend auf Score.
+Score erhöht sich bei jedem Zugriff um 1, zusätzlich bei Fragmenten mit Secret um 5.
+*/
 package database
 
 import "container/heap"

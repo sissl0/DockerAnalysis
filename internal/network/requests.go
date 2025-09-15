@@ -1,3 +1,14 @@
+/*
+Georg Heindl
+Hilfsfunktionen für Requests und Clients.
+Beachtet Ratelimits von Docker Hub, indem Requests verzögert werden und auf Reset gewartet wird.
+Params:
+- proxy: Proxy-URL (leer für keinen Proxy)
+- timeout: Timeout für HTTP Requests
+- ratelimit: Maximale Anzahl Requests pro Zeiteinheit (0 für kein Limit)
+- timelimit: Zeiteinheit für das Ratelimit (z.B. 60 Sekunden)
+*/
+
 package network
 
 import (
@@ -46,6 +57,15 @@ func NewClient(proxy string, timeout int, ratelimit uint16, timelimit time.Durat
 	return client, nil
 }
 
+/*
+Liest AuthRequestTasks aus Tasks Channel und führt Auth Requests, danach authentifizierte Manifest Requests durch.
+AuthRequestTask:
+- AuthRequest: Enthält AuthURL, Headers, Cookies, Payload, Username, AccessToken, Digest und Repo
+- ProcessResponse: Funktion zum Verarbeiten der Antwort, erhält zusätzlich Repo und Digest
+Params:
+- tasks: Channel mit AuthRequestTasks
+- num: Nummer des Clients (für Logging, falls benötigt)
+*/
 func (client *Client) AuthClientStart(tasks <-chan *AuthRequestTask, num int) {
 	for authRequestTask := range tasks {
 		sendTime := time.Now()
@@ -106,6 +126,16 @@ func (client *Client) AuthClientStart(tasks <-chan *AuthRequestTask, num int) {
 	}
 }
 
+/*
+Führt einen GET Request mit Authentifizierung durch.
+Params:
+- url: URL für den GET Request
+- headers: Header für den Request
+- cookies: Cookies für den Request
+- payload: Query-Parameter für den Request
+- username: Benutzername für Basic Auth (leer für keine Auth)
+- accesstoken: Access Token für Basic Auth (leer für keine Auth)
+*/
 func (client *Client) AuthNetwork_Get(url string, headers map[string]any, cookies map[string]any, payload map[string]any, username string, accesstoken string) (*http.Response, error) {
 	// Fetch the data with given Headers
 	req, err := http.NewRequest("GET", url, nil)
@@ -145,6 +175,12 @@ func (client *Client) AuthNetwork_Get(url string, headers map[string]any, cookie
 	return resp, nil
 }
 
+/*
+Liest RequestTasks aus Tasks Channel und führt GET Requests durch.
+RequestTask:
+- Request: Enthält URL, Headers, Cookies und Payload
+- ProcessResponse: Funktion zum Verarbeiten der Antwort
+*/
 func (client *Client) Start(tasks <-chan *RequestTask, num int) {
 	for requestTask := range tasks {
 		sendTime := time.Now()
@@ -175,7 +211,6 @@ func (client *Client) Start(tasks <-chan *RequestTask, num int) {
 }
 
 func (client *Client) Network_Get(url string, headers map[string]any, cookies map[string]any) (*http.Response, error) {
-	// Fetch the data with given Headers
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fehler beim Erstellen des Requests: %v", err)

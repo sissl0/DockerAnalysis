@@ -1,3 +1,14 @@
+/*
+Georg Heindl
+Läd Layer mit Regctl parallel in den RAM und analysiert parallel mit Gitleaks-Fork.
+Params:
+- rootCTX: Kontext für Abbruch
+- reader: JSONL-Reader mit Layern
+- resultPath: Pfad für Ergebnisse
+- maxStorage: Maximale Größe des Zwischenspeichers in Byte
+- scanWorkers: Anzahl paralleler Scanner (<#CPU-Kerne stark empfohlen)
+- downloadWorkers: Anzahl paralleler Downloader
+*/
 package cmd
 
 import (
@@ -38,6 +49,10 @@ func NewRuntimeHandler(rootCTX context.Context, reader *database.JSONLReader, re
 	return rh
 }
 
+/*
+Run startet den Runtime-Handler mit Download- und Scan-Workern.
+Blockierend.
+*/
 func (r *RuntimeHandler) Run() error {
 	inputChan := make(chan types.LayerEntry, r.downloadWorkers*4)
 	outputChan := make(chan types.Extracted, r.scanWorkers*4)
@@ -45,13 +60,12 @@ func (r *RuntimeHandler) Run() error {
 	var downloadWG sync.WaitGroup
 	var scanWG sync.WaitGroup
 
-	// Downloader starten
 	for i := 0; i < r.downloadWorkers; i++ {
 		rc := network.NewRegClient(r.rootCTX, r.storageHandler)
 		downloadWG.Add(1)
 		go func(rc *network.RegClient) {
 			defer downloadWG.Done()
-			rc.Run(inputChan, outputChan) // wg-Parameter entfernt
+			rc.Run(inputChan, outputChan)
 			rc.Stop()
 		}(rc)
 	}
@@ -65,15 +79,10 @@ func (r *RuntimeHandler) Run() error {
 		scanWG.Add(1)
 		go func(s *utils.Scanner) {
 			defer scanWG.Done()
-			s.Run(outputChan) // wg-Parameter entfernt
+			s.Run(outputChan)
 			s.Close()
 		}(scanner)
 	}
-
-	//repoCP := "balenalib/odyssey-x86-alpine-golang"
-	//repoReached := false
-	layerCP := "sha256:733b86c97151200d5790f5814ebe8aea50876842e76aca027cf2f52ff7ef02aa"
-	layerReached := false
 
 READ_LOOP:
 	for r.reader.Scanner.Scan() {
@@ -89,18 +98,7 @@ READ_LOOP:
 			fmt.Println("Error unmarshalling JSON:", err)
 			continue
 		}
-		// if rec.Repo == repoCP {
-		// 	repoReached = true
-		// }
-		// if !repoReached {
-		// 	continue
-		// }
-		if rec.Digest == layerCP {
-			layerReached = true
-		}
-		if !layerReached {
-			continue
-		}
+
 		select {
 		case <-r.rootCTX.Done():
 			break READ_LOOP
@@ -108,16 +106,12 @@ READ_LOOP:
 		}
 	}
 
-	// Producer fertig oder abgebrochen
 	close(inputChan)
 
-	// Warten bis Downloader leer sind
 	downloadWG.Wait()
 
-	// Downloader schreiben nicht mehr -> Ausgabe schließen
 	close(outputChan)
 
-	// Scanner fertig
 	scanWG.Wait()
 
 	if err := r.reader.Scanner.Err(); err != nil {

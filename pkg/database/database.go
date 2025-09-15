@@ -1,3 +1,10 @@
+/*
+Georg Heindl
+Hilfsfunktionen zum Lesen und Schreiben von JSONL-Dateien.
+JSONLWriter: Wrapper zum Schreiben von JSONL-Dateien
+RotatingJSONLWriter: Rotiert Dateien basierend auf einer maximalen Dateigröße und komprimiert alte Dateien
+JSONLReader: Wrapper zum Lesen von JSONL-Dateien
+*/
 package database
 
 import (

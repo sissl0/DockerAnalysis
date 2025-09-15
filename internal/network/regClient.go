@@ -1,3 +1,15 @@
+/*
+Georg Heindl
+Paralleler RegCtl Wrapper um Layer herunterzuladen.
+Liest Layer-Informationen von einem Input-Channel und schreibt den Blob Reader in einen Output-Channel.
+Daten werden im RAM gehalten.
+Hat Speicherreservierung, um RAM-Overflow zu vermeiden.
+Decompression Faktor wird als 3 angenommen.
+Params:
+- parent: Übergeordneter Kontext für Abbruch
+- storageHandler: Handler zur Speicherplatzverwaltung
+*/
+
 package network
 
 import (
@@ -23,7 +35,6 @@ type RegClient struct {
 	logger             *logrus.Logger
 	storagehandler     *database.StorageHandler
 	uncompressedFactor float64
-	runtimePath        string
 	scopeCount         int
 }
 
@@ -49,6 +60,9 @@ func NewRegClient(parent context.Context, storageHandler *database.StorageHandle
 	}
 }
 
+/*
+Liest Layer-Informationen von einem Input-Channel und schreibt den Blob Reader in einen Output-Channel.
+*/
 func (r *RegClient) Run(input <-chan types.LayerEntry, output chan<- types.Extracted) {
 	for record := range input {
 		select {
@@ -56,7 +70,7 @@ func (r *RegClient) Run(input <-chan types.LayerEntry, output chan<- types.Extra
 			return
 		default:
 		}
-		ext, err := r.GetBlobExtract(record)
+		ext, err := r.GetBlob(record)
 		if err != nil {
 			fmt.Printf("Error processing layer %s: %v\n", record.Digest, err)
 			continue // nichts senden bei Fehler
@@ -65,13 +79,21 @@ func (r *RegClient) Run(input <-chan types.LayerEntry, output chan<- types.Extra
 	}
 }
 
+/*
+Stoppt den RegClient und alle laufenden Operationen.
+*/
 func (r *RegClient) Stop() {
 	if r.rootCancel != nil {
 		r.rootCancel()
 	}
 }
 
-func (r *RegClient) GetBlobExtract(record types.LayerEntry) (types.Extracted, error) {
+/*
+Läd Blob und gibt den Reader zurück.
+Regctl entfernt Repositorys nicht aus Auth Bearer Scope, deshalb wird der Client alle 70 Anfragen neu erstellt.
+(Ab 70 Anfragen tritt sonst ein Fehler auf: "401 Unauthorized: authentication required")
+*/
+func (r *RegClient) GetBlob(record types.LayerEntry) (types.Extracted, error) {
 	ctx, cancel := context.WithTimeout(r.rootCTX, 30*time.Minute)
 	// Kein defer cancel im Loop
 	// --- Reservierungs-Schätzung

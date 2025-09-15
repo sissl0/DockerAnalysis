@@ -1,3 +1,9 @@
+/*
+Georg Heindl
+Client zu /scripts/pythonscripts/model_api.py.
+Skaliert Rankings für Modellinput, macht API-Request und wertet Prediction aus.
+*/
+
 package ltr
 
 import (
@@ -8,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/agnivade/levenshtein"
 	"github.com/sissl0/DockerAnalysis/internal/network"
@@ -45,6 +52,18 @@ func NewLTRClient() (*LTRClient, error) {
 		},
 	}, nil
 }
+
+/*
+Fügt einem Docker Search Ranking einen Dummy Eintrag hinzu.
+Dummy hat Reponame = Query und alle anderen Werte 0.
+Nutzt Spearman Korrelation um den mindest nötigen Rang des Dummy zu bestimmen.
+Params:
+- query: Docker Search Query
+- repos: Ranking von Repositories zu der Query
+Returns:
+- true: Repo mit Name=Query würde nicht nach dem Ranking erscheinen
+- false: Repo mit Name=Query würde nach dem Ranking erscheinen
+*/
 func (ltrcli *LTRClient) Predict(query string, repos []Repo) (bool, error) {
 	//Dummy Repo
 	dummyRepo := Repo{
@@ -104,6 +123,20 @@ func spearmanCorrelation(results []map[string]any, dummyRank_org int) (float64, 
 	return spearmanCorrelation, dummyRank
 }
 
+/*
+Skaliert Repositories für Modellinput.
+Returns:
+- log1p scaled star_count
+- log1p scaled pull_count
+- binary is_official
+- binary is_automated
+- max levenshtein similarity der Variable(repo_name, repo_owner, short_description) mit Query
+- max relative position der Variable(repo_name, repo_owner, short_description) mit Query
+- max Kategorie der Variable(repo_name, repo_owner, short_description) mit Query
+- max Jaccard Similarity der Variable(repo_name, repo_owner, short_description) mit Query
+- binary Query == Variable(repo_name, repo_owner, short_description)
+- Query in welcher Variable(repo_name, repo_owner, short_description)
+*/
 func scaleRepos(query string, repos []Repo) map[string]any {
 	scaledRepos := make([]map[string]any, len(repos))
 	for i, repo := range repos {
@@ -279,6 +312,15 @@ func get_significant_category(query string, repo Repo) float64 {
 	return math.Max(repo_name_category, math.Max(repo_owner_category, short_description_category))
 }
 
+/*
+Teilt Übereinstimmungen von repo_name und query in Kategorien ein.
+Kategorien:
+1.0: Exact Match
+0.75: query ist durch Bindestrich oder Unterstrich getrennt in repo_name enthalten
+0.5: query ist hervorgehoben in repo_name enthalten (Groß-/Kleinschreibung beachten)
+0.25: query ist in repo_name enthalten
+0.0: Keine Übereinstimmung
+*/
 func get_repo_name_category(query string, repo_name string) float64 {
 	category := 0.0
 	if query == repo_name {
@@ -294,6 +336,14 @@ func get_repo_name_category(query string, repo_name string) float64 {
 	return category
 }
 
+/*
+Teilt Übereinstimmungen von repo_owner und query in Kategorien ein.
+Kategorien:
+1.0: Exact Match
+0.66: query ist hervorgehoben in repo_owner enthalten (Groß-/Kleinschreibung beachten)
+0.33: query ist in repo_owner enthalten
+0.0: Keine Übereinstimmung
+*/
 func get_repo_owner_category(query string, repo_owner string) float64 {
 	category := 0.0
 	if query == repo_owner {
@@ -306,6 +356,10 @@ func get_repo_owner_category(query string, repo_owner string) float64 {
 	return category
 }
 
+/*
+Überprüft ob query in description hervorgehoben ist.
+Getrennt durch Groß-/Kleinschreibung, Getrennt durch Sonderzeichen
+*/
 func highlightScoreShortDescription(query string, description string) int {
 	if description == "" || query == "" {
 		return 0
@@ -340,6 +394,17 @@ func highlightScoreShortDescription(query string, description string) int {
 	return score
 }
 
+/*
+Teilt Übereinstimmungen von short_description und query in Kategorien ein.
+Kategorien:
+1.0: Exact Match
+0.833: query ist als ganzes Wort in short_description enthalten
+0.66: query ist durch spezielle Zeichen (z.B. -, _, ., /, :, ;, |, &, *, #, @, ! ) getrennt in short_description enthalten
+0.5: query ist hervorgehoben in short_description enthalten (Groß-/Kleinschreibung beachten)
+0.333: query ist hervorgehoben in short_description enthalten (Groß-/Kleinschreibung beachten)
+0.166: query ist in short_description enthalten
+0.0: Keine Übereinstimmung
+*/
 func get_short_descr_category(query string, short_description string) float64 {
 	sHighlight := highlightScoreShortDescription(query, short_description)
 
@@ -359,4 +424,55 @@ func get_short_descr_category(query string, short_description string) float64 {
 	}
 
 	return category
+}
+
+/*
+Überprüft ob query in name durch Zahlen hervorgehoben ist.
+*/
+func isHighlighted(query string, name string) bool {
+	q_type := 0
+	if isNumeric(query) {
+		q_type = 1
+	} else if isAlphabetic(query) {
+		q_type = 2
+	}
+	if q_type == 0 {
+		return false
+	}
+
+	q_idx := strings.Index(name, query)
+	if q_idx == -1 {
+		return false
+	}
+	if q_idx > 0 {
+		prev := rune(name[q_idx-1])
+		if (unicode.IsLetter(prev) && q_type == 2) || unicode.IsNumber(prev) && q_type == 1 {
+			return false
+		}
+	}
+	if q_idx+len(query) < len(name) {
+		next := rune(name[q_idx+len(query)])
+		if (unicode.IsLetter(next) && q_type == 2) || (unicode.IsNumber(next) && q_type == 1) {
+			return false
+		}
+	}
+	return true
+}
+
+func isNumeric(s string) bool {
+	for _, char := range s {
+		if !unicode.IsDigit(char) {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphabetic(s string) bool {
+	for _, char := range s {
+		if !unicode.IsLetter(char) {
+			return false
+		}
+	}
+	return true
 }

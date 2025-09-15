@@ -1,3 +1,8 @@
+/*
+Georg Heindl
+Skaliert die Features und exportiert sie in eine CSV-Datei für Learning to Rank.
+*/
+
 package ltr
 
 import (
@@ -23,8 +28,8 @@ func Run() {
 		return
 	}
 	//err = ExportToCSV(results, "repos/learningRepos_descr.csv")
-	//err = scaled_export_to_csv(results, "repos/learningRepos_descr_go_scaled.csv")
-	err = logResDataset(results, "repos/logResDS.csv")
+	err = scaled_export_to_csv(results, "repos/learningRepos_descr_go_scaled.csv")
+	//err = logResDataset(results, "repos/logResDS.csv")
 	if err != nil {
 		fmt.Println("Error exporting to CSV:", err)
 		return
@@ -91,6 +96,9 @@ func LoadData(filename string) (map[string][]map[string]any, error) {
 	return results, nil
 }
 
+/*
+Deprecated
+*/
 func logResDataset(results map[string][]map[string]any, filepath string) error {
 
 	file, err := os.Create(filepath)
@@ -176,6 +184,20 @@ func logResDataset(results map[string][]map[string]any, filepath string) error {
 
 }
 
+/*
+Exportiert die Features skaliert in eine CSV-Datei für Learning to Rank.
+Skalierung:
+- log1p scaled star_count
+- log1p scaled pull_count
+- binary is_official
+- binary is_automated
+- max levenshtein similarity der Variable(repo_name, repo_owner, short_description) mit Query
+- max relative position der Variable(repo_name, repo_owner, short_description) mit Query
+- max Kategorie der Variable(repo_name, repo_owner, short_description) mit Query
+- max Jaccard Similarity der Variable(repo_name, repo_owner, short_description) mit Query
+- binary Query == Variable(repo_name, repo_owner, short_description)
+- Query in welcher Variable(repo_name, repo_owner, short_description)
+*/
 func scaled_export_to_csv(results map[string][]map[string]any, filePath string) error {
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -234,6 +256,9 @@ func scaled_export_to_csv(results map[string][]map[string]any, filePath string) 
 	return nil
 }
 
+/*
+Deprecated
+*/
 func ExportToCSV(results map[string][]map[string]any, filePath string) error {
 	file, err := os.Create(filePath)
 	if err != nil {

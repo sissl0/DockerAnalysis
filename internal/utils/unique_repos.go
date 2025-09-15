@@ -1,3 +1,9 @@
+/*
+Georg Heindl
+Hilfsfunktionen zum Verarbeiten von Repositories.
+Beachtet Query Grenzen und speichert eindeutige Repositories in einer JSON Datei.
+*/
+
 package utils
 
 import (

@@ -1,3 +1,18 @@
+/*
+Georg Heindl
+Tiefensuche von Docker Repos über Docker Hub Search API.
+Docker Hub limitiert die Suchergebnisse auf 10.000 pro Query und Page Size 100.
+Falls mehr als 10.000 Ergebnisse, wird die Query verfeinert (Buchstaben/ Zahlen anhängen).
+Um Repos mit Name=Query aber schlechten Metadaten nicht zu übersehen, wird ein LTR-Modell verwendet, das vorhersagt,
+ob ein Repo mit Name=Query in den Top 100 Ergebnissen ist.
+Andernfalls werden die Seiten durchgegangen.
+Die Ergebnisse werden in einer JSONL-Datei gespeichert.
+Params:
+- proxies: Liste von Proxy-URLs für die parallelen Clients (falls keine Proxies, dann Liste mit leeren String(s) übergeben)
+- timeout: Timeout für HTTP Requests
+- cookies: Cookies für die Requests (falls benötigt)
+- writer: JSONL Writer zum Speichern der Repo-Informationen
+*/
 package cmd
 
 import (
@@ -64,6 +79,9 @@ func NewCollector(proxies []string, timeout int, cookies map[string]any, writer 
 	}, nil
 }
 
+/*
+Für Training-Set Generierung: Alle 3-stelligen Kombinationen bruteforcen und speichern.
+*/
 func (collector *Collector) GetWeights() {
 	ctx := context.Background()
 	for _, c1 := range characterSet {
@@ -134,6 +152,10 @@ func (collector *Collector) GetWeights() {
 	close(collector.Tasks)
 }
 
+/*
+Startet die Tiefensuche über die Docker Hub Search API.
+Start mit allen 4-stelligen Kombinationen, da nach nach Docker Naming Conventions >= 4 Zeichen.
+*/
 func (c *Collector) GetRepos() {
 	ctx := context.Background()
 	for _, c1 := range characterSet {
@@ -153,6 +175,13 @@ func (c *Collector) GetRepos() {
 	close(c.Tasks)
 }
 
+/*
+Verarbeitet Query, s.o.
+Params:
+- url: URL der Query
+- query: Query-String
+- ctx: Kontext für Redis-Operationen
+*/
 func (c *Collector) ProcessQuery(url string, query string, ctx context.Context) {
 	isMember, err := c.Redis.IsMember(ctx, "scanned_queries", url)
 	if err != nil {
@@ -160,11 +189,6 @@ func (c *Collector) ProcessQuery(url string, query string, ctx context.Context) 
 		return
 	}
 	if isMember {
-		// for _, char := range characterSet {
-		// 	newQuery := fmt.Sprintf("%s%c", query, char)
-		// 	newUrl := fmt.Sprintf("%s?query=%s&page=1&page_size=100", baseURL, newQuery)
-		// 	c.ProcessQuery(newUrl, newQuery, ctx)
-		// }
 		return
 	}
 
@@ -241,40 +265,15 @@ func (c *Collector) ProcessQuery(url string, query string, ctx context.Context) 
 					c.ProcessQuery(nextPage, query, ctx)
 				}
 			}
-
-			// //Search-Logic
-			// if results.Count > 0 {
-			// 	//Check if standard repo could come after rank 100
-			// 	if results.Count > 100 {
-			// 		res, err := c.ApiClient.Predict(query, results.Results)
-			// 		if err != nil {
-			// 			fmt.Printf("Error during prediction: %v\n", err)
-			// 			return
-			// 		}
-			// 		if !res {
-			// 			// Dummy potentially in next page, Scrape next page
-			// 			nextPage := results.Next
-			// 			if nextPage != "" {
-			// 				go c.ProcessQuery(nextPage, query, ctx)
-			// 			}
-			// 		}
-			// 	}
-			// 	for _, char := range characterSet {
-			// 		newQuery := fmt.Sprintf("%s%c", query, char)
-			// 		newUrl := fmt.Sprintf("%s?query=%s&page=1&page_size=100", baseURL, newQuery)
-			// 		go c.ProcessQuery(newUrl, newQuery, ctx)
-			// 	}
-			// } else {
-			// 	return
-			// }
-
 		},
 	}
-
 	c.Tasks <- task
-
 }
 
+/*
+Schreibt die Repo-Informationen in JSONL-Datei
+IO-Blockierung durch Mutex
+*/
 func (c *Collector) Save(results []ltr.Repo, query string) error {
 	c.saveMutex.Lock()         // Sperre den Mutex
 	defer c.saveMutex.Unlock() // Gib den Mutex frei, sobald die Methode beendet ist

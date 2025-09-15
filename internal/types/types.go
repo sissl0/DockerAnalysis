@@ -42,3 +42,28 @@ type FileRecord struct {
 	UncompressedSize int64    `json:"uncompressed_size"`
 	Secrets          []string `json:"secrets,omitempty"`
 }
+
+type Image struct {
+	Architecture string `json:"architecture"`
+	OS           string `json:"os"`
+	LastPulled   string `json:"last_pulled"`
+	LastPushed   string `json:"last_pushed"`
+	Size         int64  `json:"size"`
+	Digest       string `json:"digest"`
+	Status       string `json:"status"`
+}
+
+type TagInfo struct {
+	Images     []Image `json:"images"`
+	LastPushed string  `json:"tag_last_pushed"`
+}
+
+type Layer struct {
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
+}
+
+type RepoDigest struct {
+	RepoName string `json:"repo"`
+	Digest   string `json:"digest"`
+}

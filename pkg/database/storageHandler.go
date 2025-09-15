@@ -1,3 +1,8 @@
+/*
+Georg Heindl
+Hilfsfunktionen zum Verwalten von Platz im RAM.
+Nutzt ein blockierenden Semaphore für Acquire und Release.
+*/
 package database
 
 import (
@@ -12,6 +17,10 @@ type StorageHandler struct {
 	rootCTX    context.Context
 }
 
+/*
+NewStorageHandler erstellt einen neuen StorageHandler mit der angegebenen maximalen Speichernutzung in Bytes.
+rootCTX, für Abbruch bei Deadlocks.
+*/
 func NewStorageHandler(maxStorage int64) *StorageHandler {
 	return &StorageHandler{
 		MaxStorage: maxStorage,
@@ -30,14 +39,12 @@ func (r *StorageHandler) Acquire(bytes int64) bool {
 	if bytes > r.MaxStorage {
 		return false
 	}
-	// Kontext-abbrechbar: verhindert echten Deadlock
 	if err := r.memSem.Acquire(r.rootCTX, bytes); err != nil {
 		return false
 	}
 	return true
 }
 
-// Speicher freigeben
 func (r *StorageHandler) Release(bytes int64) {
 	if bytes <= 0 {
 		return

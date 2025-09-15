@@ -1,3 +1,20 @@
+/*
+Georg Heindl
+Paralleler Scanner für Docker Image Layer.
+Erstellt Gzip-Reader für die Layer und scannt diese mit gitleaks auf Secrets.
+Speichert:
+- File Count in Layer
+- Max. Verzeichnistiefe in Layer
+- Unkomprimierte Größe aller Dateien in Layer
+- Gefundene Secrets (mit Ursprung, Position, Dateityp, Dateigröße)
+- Liste der File-Hashes (SHA256) in Layer (auskommentiert, da aktuell nicht benötigt)
+
+Params:
+- num: Scanner-Nummer (für Verzeichnisstruktur)
+- resultPath: Basisverzeichnis für die Ergebnisse
+- storagehandler: Handler für die Speicherverwaltung
+*/
+
 package utils
 
 import (
@@ -30,6 +47,12 @@ type Scanner struct {
 	Detector       *detect.Detector
 }
 
+/*
+Erstellt Dir in resultPath:
+- scanner_num/secrets/ (für gefundene Secrets)
+- scanner_num/fileinfos/ (für File-Informationen)
+Läd Default Config für gitleaks Detector.
+*/
 func NewScanner(num uint16, resultPath string, storagehandler *database.StorageHandler) (*Scanner, error) {
 	if err := os.MkdirAll(fmt.Sprintf("%s/scanner_%d/secrets/", resultPath, num), 0755); err != nil {
 		return nil, fmt.Errorf("error creating secrets directory: %v", err)
@@ -58,11 +81,17 @@ func NewScanner(num uint16, resultPath string, storagehandler *database.StorageH
 	}, nil
 }
 
+/*
+Schließt die Writer.
+*/
 func (s *Scanner) Close() {
 	s.SecretWriter.Close()
 	s.FileInfoWriter.Close()
 }
 
+/*
+Liest Layer-Blobreaders aus dem Input-Channel und scannt diese.
+*/
 func (s *Scanner) Run(input <-chan types.Extracted) {
 	for ext := range input {
 		fmt.Printf("Scanning layer %s, Size: %d\n", ext.Record.Digest, ext.Record.Size)
@@ -74,6 +103,19 @@ func (s *Scanner) Run(input <-chan types.Extracted) {
 	}
 }
 
+/*
+Schreibt:
+- File Count in Layer
+- Max. Verzeichnistiefe in Layer
+- Unkomprimierte Größe aller Dateien in Layer
+- Gefundene Secrets (mit Ursprung, Position, Dateityp, Dateigröße)
+- Liste der File-Hashes (SHA256) in Layer (auskommentiert, da aktuell nicht benötigt)
+Nutzt MinHeap für Fragmente, gewichtet nach Anzahl des Vorkommens in Layern, um weniger zu scannen(CPU sparen)
+Params:
+- ctx: Kontext für Abbruch
+- reader: Blob-Reader für die Layer
+- digest: Layer-Digest (für Speicherung)
+*/
 func (s *Scanner) ExtractScan(ctx context.Context, reader blob.Reader, digest string) error {
 	defer reader.Close()
 	gz, err := gzip.NewReader(reader)

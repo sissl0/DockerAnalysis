@@ -1,16 +1,15 @@
+/*
+Georg Heindl
+Hilfsfunktionen zum Laden und Verarbeiten der JSONL-Dateien mit Layer- und Tag-Informationen.
+*/
 package utils
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -23,6 +22,9 @@ type LayerEntry struct {
 	Size   int64  `json:"size"`
 }
 
+/*
+Läd Tags in eine JSONL-Datei mit Repo+Digest.
+*/
 func LoadTags(outputfile string) error {
 	writer, err := database.NewJSONLWriter(outputfile)
 	if err != nil {
@@ -59,6 +61,11 @@ func LoadTags(outputfile string) error {
 	return nil
 }
 
+/*
+Läd Layer in eine JSONL-Datei mit Repo+Layer+Size.
+MaxFiles = Anzahl der layer__X.jsonl Dateien.
+Parallel, aber ungeeignet für sehr große Datenmengen (Redis speichert alle Layer im RAM).
+*/
 func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 	writer, err := database.NewJSONLWriter(outputfile)
 	if err != nil {
@@ -78,7 +85,6 @@ func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 	layerCh := make(chan layerRec, 1000)
 	errCh := make(chan error, 1)
 
-	// Worker zum Parsen der JSONL-Files (parallel)
 	var wg sync.WaitGroup
 	for i := 0; i < maxFiles; i++ {
 		wg.Add(1)
@@ -109,28 +115,24 @@ func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 		}(i)
 	}
 
-	// Channel schließen wenn alles gelesen ist
 	go func() {
 		wg.Wait()
 		close(layerCh)
 		close(errCh)
 	}()
 
-	// Consumer: schreibt nach Redis + JSONL
 	var totalsize float64
 
 	for layer := range layerCh {
-		// Redis: SADD (einzeln, damit wir added==0 prüfen können)
 		added, err := redisCli.AddToSet(ctx, "scanned_layers", layer.Layer)
 		if err != nil {
 			fmt.Println("Error adding to Redis:", err)
 			continue
 		}
 		if added == 0 {
-			continue // already in set
+			continue
 		}
 
-		// JSONL schreiben
 		if err := writer.Write(map[string]any{
 			"layer": layer.Layer,
 			"repo":  layer.Repo,
@@ -144,7 +146,6 @@ func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 
 	fmt.Println("Total size of layers:", totalsize)
 
-	// Fehler aus den Reader-Goroutines prüfen
 	select {
 	case e := <-errCh:
 		return e
@@ -153,65 +154,11 @@ func LoadLayers(layerfilepath string, maxFiles int, outputfile string) error {
 	}
 }
 
-func ExtractTar(r io.Reader, outputPath string) (int64, error) {
-	start := time.Now()
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return 0, fmt.Errorf("error creating gzip reader: %w", err)
-	}
-	defer gz.Close()
-
-	tarReader := tar.NewReader(gz)
-	var total int64
-
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return total, fmt.Errorf("error reading tar file: %w", err)
-		}
-
-		targetPath := filepath.Join(outputPath, header.Name)
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, 0o755); err != nil {
-				return total, fmt.Errorf("mkdir dir: %w", err)
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-				return total, fmt.Errorf("mkdir parent: %w", err)
-			}
-			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-			if err != nil {
-				return total, fmt.Errorf("create file: %w", err)
-			}
-			written, err := io.Copy(outFile, tarReader)
-			outFile.Close()
-			if err != nil {
-				return total, fmt.Errorf("write file: %w", err)
-			}
-			total += written // entspricht header.Size, aber sicherer falls Sparse/Anpassungen
-		case tar.TypeSymlink, tar.TypeLink:
-			continue
-		default:
-			continue
-		}
-	}
-	elapsed := time.Since(start).Seconds()
-	fmt.Printf("Extracted %d bytes in %.2f seconds (%.2f MB/s)\n", total, elapsed, float64(total)/1e6/elapsed)
-
-	return total, nil
-}
-
-// compute 10 log buckets, last one >10GB (decimal)
 func makeLogBuckets() []int64 {
 	var bounds []int64
-	minSize := float64(1)                  // 1 Byte
-	maxSize := float64(10 * 1_000_000_000) // 10 GB (decimal)
-	steps := 9                             // 9 Grenzen + letzte "infinity" bucket
+	minSize := float64(1)
+	maxSize := float64(10 * 1_000_000_000)
+	steps := 9
 	logMin := math.Log10(minSize)
 	logMax := math.Log10(maxSize)
 	step := (logMax - logMin) / float64(steps-1)
@@ -219,7 +166,7 @@ func makeLogBuckets() []int64 {
 		b := math.Pow(10, logMin+step*float64(i))
 		bounds = append(bounds, int64(b))
 	}
-	bounds = append(bounds, math.MaxInt64) // >10GB
+	bounds = append(bounds, math.MaxInt64)
 	return bounds
 }
 

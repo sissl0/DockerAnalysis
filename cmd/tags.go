@@ -1,3 +1,15 @@
+/*
+Georg Heindl
+Paralleler Collector für Docker Image Tags.
+Führt Requests durch, um die Tags eines Repositories abzurufen.
+Speichert die Tag-Informationen in einer JSONL-Datei.
+Params:
+- proxies: Liste von Proxy-URLs für die parallelen Clients (falls keine Proxies, dann Liste mit leeren String(s) übergeben)
+- timeout: Timeout für HTTP Requests
+- cookies: Cookies für die Requests (falls benötigt)
+- writer: JSONL Writer zum Speichern der Tag-Informationen
+- repofile: Pfad zur JSON-Datei mit Liste der Repositories
+*/
 package cmd
 
 import (
@@ -11,35 +23,20 @@ import (
 	"time"
 
 	"github.com/sissl0/DockerAnalysis/internal/network"
+	"github.com/sissl0/DockerAnalysis/internal/types"
 	"github.com/sissl0/DockerAnalysis/pkg/database"
 )
 
 const (
 	tagBaseURL = "https://hub.docker.com/v2/repositories/"
-	// htax/aa/tags?page_size=25&page=1&ordering=last_updated&name="
 )
 
 type TagCollector struct {
 	Writer    *database.RotatingJSONLWriter
-	saveMutex sync.Mutex // Mutex for thread-safe access
+	saveMutex sync.Mutex
 	Tasks     chan *network.RequestTask
 	Headers   map[string]any
 	Redis     *database.RedisClient
-}
-
-type Image struct {
-	Architecture string `json:"architecture"`
-	OS           string `json:"os"`
-	LastPulled   string `json:"last_pulled"`
-	LastPushed   string `json:"last_pushed"`
-	Size         int64  `json:"size"`
-	Digest       string `json:"digest"`
-	Status       string `json:"status"`
-}
-
-type TagInfo struct {
-	Images     []Image `json:"images"`
-	LastPushed string  `json:"tag_last_pushed"`
 }
 
 func NewTagCollector(proxies []string, timeout int, cookies map[string]any, writer *database.RotatingJSONLWriter) (*TagCollector, error) {
@@ -73,6 +70,10 @@ func NewTagCollector(proxies []string, timeout int, cookies map[string]any, writ
 	}, nil
 }
 
+/*
+Liest Repos aus der JSON-Datei und fragt die Tags für jedes Repo an.
+Blockierend, bis Tasks für 300 Sekunden leer sind.
+*/
 func (collector *TagCollector) Get_tags(repofile string) {
 	file, err := os.Open(repofile)
 	if err != nil {
@@ -104,6 +105,12 @@ func (collector *TagCollector) Get_tags(repofile string) {
 	close(collector.Tasks)
 }
 
+/*
+Rekursiver Aufruf, um alle Seiten der Tags eines Repos abzufragen.
+Keine einheitlichen Versionsnamen, daher werden nur Tags berücksichtigt, deren letzte Änderung
+mindestens 7 Tage auseinander liegt.
+*/
+
 func (collector *TagCollector) ProcessTag(url string, repo string) {
 	isMember, err := collector.Redis.IsMember(context.Background(), "scanned_tags", url)
 	if err != nil {
@@ -126,9 +133,9 @@ func (collector *TagCollector) ProcessTag(url string, repo string) {
 				return
 			}
 			var results struct {
-				Results []TagInfo `json:"results"`
-				Count   float64   `json:"count"`
-				Next    string    `json:"next"`
+				Results []types.TagInfo `json:"results"`
+				Count   float64         `json:"count"`
+				Next    string          `json:"next"`
 			}
 
 			if resp.Header.Get("Content-Encoding") == "gzip" {
@@ -168,6 +175,7 @@ func (collector *TagCollector) ProcessTag(url string, repo string) {
 						}
 					}
 				}
+				prev_last_pushed = last_pushed
 			}
 			if added, err := collector.Redis.AddToSet(context.Background(), "scanned_tags", url); err != nil || added == -1 {
 				fmt.Printf("Fehler beim Hinzufügen der URL %s zu Redis: %v\n", url, err)
@@ -181,9 +189,13 @@ func (collector *TagCollector) ProcessTag(url string, repo string) {
 	collector.Tasks <- task
 }
 
-func (c *TagCollector) Save(image Image, repo_name string) error {
-	c.saveMutex.Lock()         // Sperre den Mutex
-	defer c.saveMutex.Unlock() // Gib den Mutex frei, sobald die Methode beendet ist
+/*
+Schreibt die Tag-Informationen in JSONL-Datei
+IO-Blockierung durch Mutex
+*/
+func (c *TagCollector) Save(image types.Image, repo_name string) error {
+	c.saveMutex.Lock()
+	defer c.saveMutex.Unlock()
 	if err := c.Writer.Write(map[string]any{
 		"repo_name":    repo_name,
 		"architecture": image.Architecture,

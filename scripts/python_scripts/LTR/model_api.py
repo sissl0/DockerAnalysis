@@ -1,3 +1,12 @@
+"""
+Georg Heindl
+Das LTR Modell kann nicht direkt in GO geladen werden, daher wird ein kleiner API-Service in Python
+gestartet, der das Modell lädt und Vorhersagen macht.
+Die API erwartet eine POST-Anfrage mit einem JSON-Payload, der eine Liste von Repositories [RepoInput] enthält.
+Die Antwort ist eine Liste von Scores für jedes Repository.
+FastAPI für API und uvicorn für Endpunkt.
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import lightgbm as lgb
@@ -5,14 +14,11 @@ import numpy as np
 import uvicorn
 from typing import List
 
-# Lade das LightGBM-Modell
 model = lgb.Booster(model_file="docker_ranker.txt")
 
-# Reihenfolge der Features
 FEATURE_ORDER = ['star_count', 'pull_count', 'is_official', 'is_automated', 'significant_levenshtein', 'significant_position', 'significant_category', 'significant_jaccard', 'query_find',
             'is_standalone']
 
-# Eingabedaten-Schema
 class RepoInput(BaseModel):
     repo_name_cat: float
     star_count: float
@@ -21,7 +27,6 @@ class RepoInput(BaseModel):
     is_automated: int
     rank: int
 
-# Initialisiere die FastAPI-Anwendung
 app = FastAPI()
 
 @app.post("/predict")
@@ -40,7 +45,6 @@ def predict(payload: dict):
         "rank": repo["rank"],
         
     } for i, (repo, score) in enumerate(comb)]
-    
-# Starte die Anwendung
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
