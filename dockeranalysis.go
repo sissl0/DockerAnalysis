@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 	"strconv"
-	"time"
 
 	"github.com/sissl0/DockerAnalysis/analysis"
 	"github.com/sissl0/DockerAnalysis/cmd"
@@ -319,29 +316,62 @@ func main() {
 
 	case "load_to_ps":
 		if len(os.Args) < 7 {
-			fmt.Println("Usage: load_to_ps <repo_file> <tag_file> <layer_file> <layer_data_file> <secrets_file>")
+			fmt.Println("Usage: load_to_ps <ps_address> <digestPath> <uniqueReposPath> <TagsPath> <LayersPath> <SecretsPath>")
 			return
 		}
-		connStr := ""
-		analysis.Run(connStr, os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6])
-	case "fix_layer_tag_con":
-		connStr := "postgres://postgres:mypassword@localhost:5500/postgres?sslmode=disable"
-		db, err := sql.Open("pgx", connStr)
+		ctx := context.Background()
+		err := analysis.ImportSelectedToPostgres(ctx, os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6], os.Args[7], 1000)
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println("Error loading to Postgres:", err)
+			return
 		}
-		defer db.Close()
+		//ctx := context.Background()
+		//analysis.ImportOnlySecrets(ctx, "postgres://postgres:mypassword@localhost:5500/postgres?sslmode=disable", "data/digest_analysis.jsonl", "runtime/combined_fileinfos.jsonl", "runtime/combined_secrets.jsonl", 1000)
 
-		// Pool-Parameter (optional)
-		db.SetMaxOpenConns(16)
-		db.SetMaxIdleConns(16)
-		db.SetConnMaxLifetime(30 * time.Minute)
-
-		// Verbindung testen
-		if err := db.Ping(); err != nil {
-			log.Fatal(err)
+	case "precompute_tags":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: precompute_tags <tag_file>")
+			return
 		}
-		analysis.FixLayerTagConnections(db)
+		stats, err := analysis.PrecomputeFullTagStats(context.Background(), os.Args[2], 1_000_000)
+		if err != nil {
+			fmt.Println("Error precomputing tag stats:", err)
+		}
+		if err := analysis.WriteHistogramCSV(stats.LastPushedMonth, "full_last_pushed_month.csv"); err != nil {
+			fmt.Println("Error writing last pushed month histogram:", err)
+		}
+		if err := analysis.WriteHistogramCSV(stats.StatusCounts, "full_status.csv"); err != nil {
+			fmt.Println("Error writing status histogram:", err)
+		}
+		if err := analysis.WriteSeriesCSV(stats.LastPushedEpoch, "full_last_pushed_epoch_reservoir.csv"); err != nil {
+			fmt.Println("Error writing last pushed epoch series:", err)
+		}
+		if err := analysis.WriteSeriesCSV(stats.SizeSample, "full_size_reservoir.csv"); err != nil {
+			fmt.Println("Error writing size series:", err)
+		}
+
+	case "precompute_repos":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: precompute_repos <unique_repos.jsonl>")
+			return
+		}
+		stats, err := analysis.PrecomputeFullRepoStats(context.Background(), os.Args[2], 1_000_000)
+		if err != nil {
+			fmt.Println("Error precomputing repo stats:", err)
+			return
+		}
+		if err := analysis.WriteHistogramCSV(stats.IsOfficialCounts, "full_is_official.csv"); err != nil {
+			fmt.Println("Error writing is_official histogram:", err)
+		}
+		if err := analysis.WriteSeriesCSV(stats.PullCountSample, "full_pull_count_reservoir.csv"); err != nil {
+			fmt.Println("Error writing pull_count series:", err)
+		}
+		if len(stats.StarCountSample) > 0 {
+			if err := analysis.WriteSeriesCSV(stats.StarCountSample, "full_star_count_reservoir.csv"); err != nil {
+				fmt.Println("Error writing star_count series:", err)
+			}
+		}
+
 	default:
 		panic("Unknown command: " + os.Args[1])
 	}
